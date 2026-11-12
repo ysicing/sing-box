@@ -148,7 +148,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	if selectedRule == nil {
 		selectedOutbound = r.outbound.Default()
 	}
-	chain, err := resolveOutbound(selectedOutbound, N.NetworkTCP)
+	chain, err := resolveOutbound(selectedOutbound, N.NetworkTCP, &metadata)
 	if err != nil {
 		buf.ReleaseMulti(buffers)
 		return err
@@ -175,14 +175,24 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	return nil
 }
 
-func resolveOutbound(outbound adapter.Outbound, network string) ([]adapter.Outbound, error) {
+// resolveOutbound 把出站组逐层展开到实际拨号的叶子出站。
+// metadata 为 nil 表示当前还不是一条确定的连接（预匹配阶段），此时遇到按连接选择的出站组直接报错，
+// 交由后续正常路由选择，避免同一条连接推进两次选择状态。
+func resolveOutbound(outbound adapter.Outbound, network string, metadata *adapter.InboundContext) ([]adapter.Outbound, error) {
 	chain := []adapter.Outbound{outbound}
 	for {
 		group, isGroup := outbound.(adapter.OutboundGroup)
 		if !isGroup {
 			break
 		}
-		outbound = group.Selected(network)
+		if connectionGroup, isConnectionGroup := group.(adapter.ConnectionOutboundGroup); isConnectionGroup {
+			if metadata == nil {
+				return nil, E.New("outbound requires per-connection selection: ", group.Tag())
+			}
+			outbound = connectionGroup.SelectConnection(metadata, network)
+		} else {
+			outbound = group.Selected(network)
+		}
 		if outbound == nil {
 			return nil, E.New(strings.ToUpper(network), " is not supported by outbound: ", group.Tag())
 		}
@@ -313,7 +323,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	if selectedRule == nil || selectReturn {
 		selectedOutbound = r.outbound.Default()
 	}
-	chain, err := resolveOutbound(selectedOutbound, N.NetworkUDP)
+	chain, err := resolveOutbound(selectedOutbound, N.NetworkUDP, &metadata)
 	if err != nil {
 		N.ReleaseMultiPacketBuffer(packetBuffers)
 		return err
@@ -491,7 +501,7 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 			return continueResult
 		}
 	}
-	chain, err := resolveOutbound(outbound, metadata.Network)
+	chain, err := resolveOutbound(outbound, metadata.Network, nil)
 	if err != nil {
 		return continueResult
 	}

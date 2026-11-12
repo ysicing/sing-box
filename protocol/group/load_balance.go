@@ -16,6 +16,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -27,11 +28,18 @@ func RegisterLoadBalance(registry *outbound.Registry) {
 	outbound.Register[option.LoadBalanceOutboundOptions](registry, C.TypeLoadBalance, NewLoadBalance)
 }
 
-var _ adapter.OutboundGroup = (*LoadBalance)(nil)
+var _ adapter.ConnectionOutboundGroup = (*LoadBalance)(nil)
 
 const (
 	LoadBalanceStrategyRoundRobin = "round-robin"
 	LoadBalanceStrategyDomain     = "domain"
+)
+
+const (
+	// 域名分配在最近一次访问后保留的时长
+	loadBalanceDomainTTL = 10 * time.Minute
+	// 过期条目的清理间隔。清理需要在锁内全表扫描，不能每次未命中都做
+	loadBalanceSweepInterval = time.Minute
 )
 
 type domainEntry struct {
@@ -46,9 +54,11 @@ type LoadBalance struct {
 	members      []adapter.Outbound
 	next         atomic.Uint64
 	strategy     string
-	selectionMu  sync.Mutex
 	lastSelected atomic.Int64
+	// 以下字段由 domainAccess 保护
+	domainAccess sync.Mutex
 	domainCache  map[string]domainEntry
+	nextSweep    time.Time
 }
 
 func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.LoadBalanceOutboundOptions) (adapter.Outbound, error) {
@@ -95,10 +105,9 @@ func (l *LoadBalance) Start(stage adapter.StartStage, scope *adapter.Scope) erro
 
 func (l *LoadBalance) All() []string { return l.tags }
 
+// Selected 返回最近一次选中的成员，仅用于面板展示和延迟历史查询；
+// 实际分流由 SelectConnection（路由）和 DialContext/ListenPacket（detour）完成。
 func (l *LoadBalance) Selected(network string) adapter.Outbound {
-	if len(l.members) == 0 {
-		return nil
-	}
 	index := l.lastSelected.Load()
 	if index < 0 || index >= int64(len(l.members)) {
 		return nil
@@ -106,57 +115,90 @@ func (l *LoadBalance) Selected(network string) adapter.Outbound {
 	return l.members[index]
 }
 
-func (l *LoadBalance) selectedIndex(ctx context.Context, destination M.Socksaddr, network string) int {
-	if l.strategy == LoadBalanceStrategyRoundRobin {
-		return l.nextIndex()
+func (l *LoadBalance) SelectConnection(metadata *adapter.InboundContext, network string) adapter.Outbound {
+	return l.selectMember(metadata, M.Socksaddr{}, network)
+}
+
+func (l *LoadBalance) selectMember(metadata *adapter.InboundContext, destination M.Socksaddr, network string) adapter.Outbound {
+	if len(l.members) == 0 {
+		return nil
 	}
-	if ctx != nil {
-		if metadata := adapter.ContextFrom(ctx); metadata != nil {
-			if metadata.Destination.IsValid() {
-				destination = metadata.Destination
-			}
+	var start int
+	if l.strategy == LoadBalanceStrategyDomain {
+		start = l.domainIndex(loadBalanceKey(metadata, destination))
+	} else {
+		start = l.nextIndex()
+	}
+	// 从选中位置向后找第一个支持该网络的成员：不支持 UDP 的成员不会让连接失败，
+	// 同一域名的回退结果也保持稳定。代价是被跳过成员的份额会落到它的后继上。
+	network = N.NetworkName(network)
+	for offset := range l.members {
+		index := (start + offset) % len(l.members)
+		member := l.members[index]
+		if common.Contains(member.Network(), network) {
+			l.lastSelected.Store(int64(index))
+			return member
 		}
 	}
-	host := strings.TrimSuffix(destination.Fqdn, ".")
+	return nil
+}
+
+// loadBalanceKey 计算 domain 策略的粘连键：可注册域名，或规范化后的 IP。
+func loadBalanceKey(metadata *adapter.InboundContext, destination M.Socksaddr) string {
+	var host string
+	if metadata != nil {
+		// TUN/透明代理下 Destination 是 IP，域名只存在于嗅探结果里，必须优先使用
+		host = metadata.Domain
+		if host == "" && metadata.Destination.IsValid() {
+			destination = metadata.Destination
+		}
+	}
 	if host == "" {
-		host = destination.AddrString()
+		host = destination.Fqdn
 	}
+	if host == "" {
+		return destination.Addr.WithZone("").Unmap().String()
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
 	if addr, err := netip.ParseAddr(host); err == nil {
-		host = addr.WithZone("").Unmap().String()
-	} else if site, err := publicsuffix.EffectiveTLDPlusOne(host); err == nil {
-		host = site
+		return addr.WithZone("").Unmap().String()
 	}
-	l.selectionMu.Lock()
-	defer l.selectionMu.Unlock()
+	if site, err := publicsuffix.EffectiveTLDPlusOne(host); err == nil {
+		return site
+	}
+	return host
+}
+
+func (l *LoadBalance) domainIndex(key string) int {
+	l.domainAccess.Lock()
+	defer l.domainAccess.Unlock()
 	now := time.Now()
-	if entry, exists := l.domainCache[host]; exists && now.Before(entry.expires) {
-		entry.expires = now.Add(10 * time.Minute)
-		l.domainCache[host] = entry
+	if entry, exists := l.domainCache[key]; exists && now.Before(entry.expires) {
+		entry.expires = now.Add(loadBalanceDomainTTL)
+		l.domainCache[key] = entry
 		return entry.index
 	}
 	index := l.nextIndex()
-	l.domainCache[host] = domainEntry{index, now.Add(10 * time.Minute)}
-	for domain, entry := range l.domainCache {
-		if now.After(entry.expires) {
-			delete(l.domainCache, domain)
+	l.domainCache[key] = domainEntry{index, now.Add(loadBalanceDomainTTL)}
+	if now.After(l.nextSweep) {
+		l.nextSweep = now.Add(loadBalanceSweepInterval)
+		for domain, entry := range l.domainCache {
+			if now.After(entry.expires) {
+				delete(l.domainCache, domain)
+			}
 		}
 	}
 	return index
 }
 
 func (l *LoadBalance) nextIndex() int {
-	index := int((l.next.Add(1) - 1) % uint64(len(l.members)))
-	l.lastSelected.Store(int64(index))
-	return index
+	return int((l.next.Add(1) - 1) % uint64(len(l.members)))
 }
 
 func (l *LoadBalance) AttachConnection(closer io.Closer) func() { return func() {} }
 
 func (l *LoadBalance) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	if len(l.members) == 0 {
-		return nil, E.New("missing supported outbound")
-	}
-	member := l.members[l.selectedIndex(ctx, destination, network)]
+	member := l.selectMember(adapter.ContextFrom(ctx), destination, network)
 	if member == nil {
 		return nil, E.New("missing supported outbound")
 	}
@@ -164,10 +206,7 @@ func (l *LoadBalance) DialContext(ctx context.Context, network string, destinati
 }
 
 func (l *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	if len(l.members) == 0 {
-		return nil, E.New("missing supported outbound")
-	}
-	member := l.members[l.selectedIndex(ctx, destination, N.NetworkUDP)]
+	member := l.selectMember(adapter.ContextFrom(ctx), destination, N.NetworkUDP)
 	if member == nil {
 		return nil, E.New("missing supported outbound")
 	}

@@ -155,6 +155,14 @@ type OutboundGroup interface {
 	AttachConnection(closer io.Closer) (detach func())
 }
 
+// ConnectionOutboundGroup 是按连接选择成员的出站组。
+// Selected 拿不到连接信息，只能返回最近一次的选择结果（供面板展示），
+// 因此路由展开出站链时必须改用 SelectConnection，且每条连接只调用一次。
+type ConnectionOutboundGroup interface {
+	OutboundGroup
+	SelectConnection(metadata *InboundContext, network string) Outbound
+}
+
 type URLTestGroup interface {
 	OutboundGroup
 	URLTest(ctx context.Context) (map[string]uint16, error)
