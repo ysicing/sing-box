@@ -233,6 +233,8 @@ type URLTestGroup struct {
 	close                        chan struct{}
 	started                      bool
 	lastActive                   common.TypedValue[time.Time]
+	// 非空时取代默认的“选出最快成员”逻辑，供复用测试循环的其他出站组（load-balance）处理测试结果
+	updateHandler func()
 }
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
@@ -503,6 +505,10 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 func (g *URLTestGroup) performUpdateCheck() {
 	g.updateAccess.Lock()
 	defer g.updateAccess.Unlock()
+	if g.updateHandler != nil {
+		g.updateHandler()
+		return
+	}
 	var (
 		updated  bool
 		selected bool

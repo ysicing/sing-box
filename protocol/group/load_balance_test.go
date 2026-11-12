@@ -5,12 +5,16 @@ import (
 	"net"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
+	"github.com/sagernet/sing-box/common/urltest"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
 
 	"github.com/stretchr/testify/require"
 )
@@ -29,17 +33,44 @@ func (m *testMember) ListenPacket(ctx context.Context, destination M.Socksaddr) 
 
 func newTestLoadBalance(t *testing.T, strategy string, networks ...[]string) *LoadBalance {
 	t.Helper()
-	tags := []string{"a", "b", "c"}[:len(networks)]
-	created, err := NewLoadBalance(context.Background(), nil, nil, "lb", option.LoadBalanceOutboundOptions{
-		Outbounds: tags,
-		Strategy:  strategy,
-	})
+	return newTestLoadBalanceWithOptions(t, option.LoadBalanceOutboundOptions{Strategy: strategy}, networks...)
+}
+
+func newTestLoadBalanceWithOptions(t *testing.T, options option.LoadBalanceOutboundOptions, networks ...[]string) *LoadBalance {
+	t.Helper()
+	options.Outbounds = []string{"a", "b", "c"}[:len(networks)]
+	ctx := service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage())
+	created, err := NewLoadBalance(ctx, nil, log.NewNOPFactory().Logger(), "lb", options)
 	require.NoError(t, err)
 	loadBalance := created.(*LoadBalance)
-	for i, tag := range tags {
-		loadBalance.members = append(loadBalance.members, &testMember{outbound.NewAdapter("test", tag, networks[i], nil)})
+	members := make([]adapter.Outbound, 0, len(networks))
+	for i, tag := range options.Outbounds {
+		members = append(members, &testMember{outbound.NewAdapter("test", tag, networks[i], nil)})
 	}
+	require.NoError(t, loadBalance.initialize(members))
 	return loadBalance
+}
+
+// setTestDelays 写入各成员的测试结果（0 表示测试失败）并触发一次可用性更新。
+func setTestDelays(loadBalance *LoadBalance, delays ...uint16) {
+	for i, delay := range delays {
+		tag := loadBalance.members[i].Tag()
+		if delay == 0 {
+			loadBalance.group.history.DeleteURLTestHistory(tag)
+		} else {
+			loadBalance.group.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{Time: time.Now(), Delay: delay})
+		}
+	}
+	loadBalance.PerformUpdateCheck()
+}
+
+type testCloser struct {
+	closed bool
+}
+
+func (c *testCloser) Close() error {
+	c.closed = true
+	return nil
 }
 
 var testBoth = []string{N.NetworkTCP, N.NetworkUDP}
@@ -65,9 +96,8 @@ func TestLoadBalanceSkipUnsupportedNetwork(t *testing.T) {
 	t.Parallel()
 	loadBalance := newTestLoadBalance(t, "", testBoth, []string{N.NetworkTCP}, testBoth)
 	tags := selectTags(loadBalance, N.NetworkUDP, make([]adapter.InboundContext, 6)...)
-	require.NotContains(t, tags, "b")
-	require.Contains(t, tags, "a")
-	require.Contains(t, tags, "c")
+	// 在支持该网络的成员之间均分，而不是把被跳过成员的份额压给后继
+	require.Equal(t, []string{"a", "c", "a", "c", "a", "c"}, tags)
 
 	tcpOnly := newTestLoadBalance(t, "", []string{N.NetworkTCP})
 	require.Nil(t, tcpOnly.SelectConnection(&adapter.InboundContext{}, N.NetworkUDP))
@@ -103,4 +133,78 @@ func TestLoadBalanceDialContext(t *testing.T) {
 		require.ErrorIs(t, err, net.ErrClosed)
 		require.Equal(t, expected, loadBalance.Selected(N.NetworkTCP).Tag())
 	}
+}
+
+func TestLoadBalanceHealthCheck(t *testing.T) {
+	t.Parallel()
+	loadBalance := newTestLoadBalance(t, "", testBoth, testBoth, testBoth)
+	six := func() []string {
+		return selectTags(loadBalance, N.NetworkTCP, make([]adapter.InboundContext, 6)...)
+	}
+	// 首轮测试完成前不过滤
+	require.Equal(t, []string{"a", "b", "c", "a", "b", "c"}, six())
+
+	setTestDelays(loadBalance, 100, 0, 300)
+	require.Equal(t, []string{"a", "c", "a", "c", "a", "c"}, six())
+
+	// 成员恢复后重新参与分流
+	setTestDelays(loadBalance, 100, 200, 300)
+	require.ElementsMatch(t, []string{"a", "a", "b", "b", "c", "c"}, six())
+
+	// 全部测试失败时退回全体成员，而不是拒绝连接
+	setTestDelays(loadBalance, 0, 0, 0)
+	require.ElementsMatch(t, []string{"a", "a", "b", "b", "c", "c"}, six())
+}
+
+func TestLoadBalanceTolerance(t *testing.T) {
+	t.Parallel()
+	loadBalance := newTestLoadBalanceWithOptions(t, option.LoadBalanceOutboundOptions{Tolerance: 50}, testBoth, testBoth, testBoth)
+	closer := new(testCloser)
+	loadBalance.AttachMemberConnection(loadBalance.members[2], closer)
+	setTestDelays(loadBalance, 100, 150, 100)
+	setTestDelays(loadBalance, 100, 150, 151)
+	tags := selectTags(loadBalance, N.NetworkTCP, make([]adapter.InboundContext, 4)...)
+	require.NotContains(t, tags, "c")
+	require.Contains(t, tags, "a")
+	require.Contains(t, tags, "b")
+	// 只是偏慢的成员不算失效，已有连接保留
+	require.False(t, closer.closed)
+}
+
+func TestLoadBalanceInterrupt(t *testing.T) {
+	t.Parallel()
+	// 路由连接属于入站连接，未开启 interrupt_exist_connections 时不中断
+	keep := newTestLoadBalance(t, "", testBoth, testBoth)
+	kept := new(testCloser)
+	keep.AttachMemberConnection(keep.members[1], kept)
+	setTestDelays(keep, 100, 100)
+	setTestDelays(keep, 100, 0)
+	require.False(t, kept.closed)
+
+	loadBalance := newTestLoadBalanceWithOptions(t, option.LoadBalanceOutboundOptions{InterruptExistConnections: true}, testBoth, testBoth)
+	closers := []*testCloser{new(testCloser), new(testCloser)}
+	for i, closer := range closers {
+		loadBalance.AttachMemberConnection(loadBalance.members[i], closer)
+	}
+	setTestDelays(loadBalance, 100, 100)
+	setTestDelays(loadBalance, 100, 0)
+	// 只中断失效成员上的连接
+	require.False(t, closers[0].closed)
+	require.True(t, closers[1].closed)
+
+	// 全部测试失败多半是测试地址或本机网络的问题，不中断
+	setTestDelays(loadBalance, 0, 0)
+	require.False(t, closers[0].closed)
+}
+
+func TestLoadBalanceDomainReassign(t *testing.T) {
+	t.Parallel()
+	loadBalance := newTestLoadBalance(t, LoadBalanceStrategyDomain, testBoth, testBoth)
+	metadata := adapter.InboundContext{Domain: "example.com"}
+	require.Equal(t, "a", loadBalance.SelectConnection(&metadata, N.NetworkTCP).Tag())
+	setTestDelays(loadBalance, 0, 100)
+	require.Equal(t, "b", loadBalance.SelectConnection(&metadata, N.NetworkTCP).Tag())
+	// 原成员恢复后不切回，避免来回跳
+	setTestDelays(loadBalance, 100, 100)
+	require.Equal(t, "b", loadBalance.SelectConnection(&metadata, N.NetworkTCP).Tag())
 }

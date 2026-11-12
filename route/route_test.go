@@ -33,8 +33,14 @@ func (o *testOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 // testConnectionGroup 的 Selected 固定返回第一个成员，只有 SelectConnection 会轮换。
 type testConnectionGroup struct {
 	*testOutbound
-	members []adapter.Outbound
-	next    int
+	members  []adapter.Outbound
+	next     int
+	attached []string
+}
+
+func (g *testConnectionGroup) AttachMemberConnection(member adapter.Outbound, closer io.Closer) func() {
+	g.attached = append(g.attached, member.Tag())
+	return func() {}
 }
 
 func (g *testConnectionGroup) All() []string { return nil }
@@ -61,8 +67,13 @@ func TestResolveOutboundConnectionGroup(t *testing.T) {
 		require.Len(t, chain, 2)
 		require.Equal(t, expected, chain[1].Tag())
 	}
+	// 连接要登记到它实际使用的成员上，成员失效时才能只中断这些连接
+	chain, err := resolveOutbound(group, N.NetworkTCP, &adapter.InboundContext{})
+	require.NoError(t, err)
+	registerInterrupt(chain, io.NopCloser(nil), func(error) {})
+	require.Equal(t, []string{chain[1].Tag()}, group.attached)
 	// 预匹配阶段不能消耗选择状态，否则随后的正常路由会让同一条连接推进两次
-	_, err := resolveOutbound(group, N.NetworkTCP, nil)
+	_, err = resolveOutbound(group, N.NetworkTCP, nil)
 	require.Error(t, err)
-	require.Equal(t, 3, group.next)
+	require.Equal(t, 4, group.next)
 }

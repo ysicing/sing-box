@@ -206,9 +206,14 @@ func resolveOutbound(outbound adapter.Outbound, network string, metadata *adapte
 
 func registerInterrupt(chain []adapter.Outbound, closer io.Closer, onClose N.CloseHandlerFunc) N.CloseHandlerFunc {
 	var removers []func()
-	for _, outbound := range chain {
+	for i, outbound := range chain {
 		group, isGroup := outbound.(adapter.OutboundGroup)
 		if !isGroup {
+			continue
+		}
+		// 出站组不会是链尾，chain[i+1] 就是它为这条连接选中的成员
+		if connectionGroup, isConnectionGroup := group.(adapter.ConnectionOutboundGroup); isConnectionGroup && i+1 < len(chain) {
+			removers = append(removers, connectionGroup.AttachMemberConnection(chain[i+1], closer))
 			continue
 		}
 		removers = append(removers, group.AttachConnection(closer))
