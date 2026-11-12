@@ -19,4 +19,4 @@ Outbound tags used in round-robin order for each new connection.
 
 #### strategy
 
-Load balancing strategy. `round-robin` distributes requests in rotation, `consistent-hashing` sends requests for the same destination to the same outbound, and `sticky-sessions` sends requests with the same source and destination to the same outbound for 10 minutes. Defaults to `round-robin`.
+Load balancing strategy. `round-robin` distributes connections in rotation. `domain` assigns each registrable domain to an outbound using round-robin and reuses that assignment for 10 minutes after the most recent request. Defaults to `round-robin`.

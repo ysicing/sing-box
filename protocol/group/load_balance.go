@@ -2,10 +2,11 @@ package group
 
 import (
 	"context"
-	"hash/fnv"
 	"io"
 	"net"
+	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +20,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
+	"golang.org/x/net/publicsuffix"
 )
 
 func RegisterLoadBalance(registry *outbound.Registry) {
@@ -28,25 +30,25 @@ func RegisterLoadBalance(registry *outbound.Registry) {
 var _ adapter.OutboundGroup = (*LoadBalance)(nil)
 
 const (
-	LoadBalanceStrategyRoundRobin        = "round-robin"
-	LoadBalanceStrategyConsistentHashing = "consistent-hashing"
-	LoadBalanceStrategyStickySessions    = "sticky-sessions"
+	LoadBalanceStrategyRoundRobin = "round-robin"
+	LoadBalanceStrategyDomain     = "domain"
 )
 
-type stickyEntry struct {
+type domainEntry struct {
 	index   int
 	expires time.Time
 }
 
 type LoadBalance struct {
 	outbound.Adapter
-	manager        adapter.OutboundManager
-	tags           []string
-	members        []adapter.Outbound
-	next           atomic.Uint64
-	strategy       string
-	sticky         sync.Mutex
-	stickySessions map[string]stickyEntry
+	manager      adapter.OutboundManager
+	tags         []string
+	members      []adapter.Outbound
+	next         atomic.Uint64
+	strategy     string
+	selectionMu  sync.Mutex
+	lastSelected atomic.Int64
+	domainCache  map[string]domainEntry
 }
 
 func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.LoadBalanceOutboundOptions) (adapter.Outbound, error) {
@@ -58,7 +60,7 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 		strategy = LoadBalanceStrategyRoundRobin
 	}
 	switch strategy {
-	case LoadBalanceStrategyRoundRobin, LoadBalanceStrategyConsistentHashing, LoadBalanceStrategyStickySessions:
+	case LoadBalanceStrategyRoundRobin, LoadBalanceStrategyDomain:
 	default:
 		return nil, E.New("unknown load balance strategy: ", strategy)
 	}
@@ -68,11 +70,11 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 		}
 	}
 	return &LoadBalance{
-		Adapter:        outbound.NewAdapter(C.TypeLoadBalance, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
-		manager:        service.FromContext[adapter.OutboundManager](ctx),
-		tags:           options.Outbounds,
-		strategy:       strategy,
-		stickySessions: make(map[string]stickyEntry),
+		Adapter:     outbound.NewAdapter(C.TypeLoadBalance, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
+		manager:     service.FromContext[adapter.OutboundManager](ctx),
+		tags:        options.Outbounds,
+		strategy:    strategy,
+		domainCache: make(map[string]domainEntry),
 	}, nil
 }
 
@@ -97,44 +99,54 @@ func (l *LoadBalance) Selected(network string) adapter.Outbound {
 	if len(l.members) == 0 {
 		return nil
 	}
-	return l.members[l.selectedIndex(nil, M.Socksaddr{}, network)]
+	index := l.lastSelected.Load()
+	if index < 0 || index >= int64(len(l.members)) {
+		return nil
+	}
+	return l.members[index]
 }
 
 func (l *LoadBalance) selectedIndex(ctx context.Context, destination M.Socksaddr, network string) int {
 	if l.strategy == LoadBalanceStrategyRoundRobin {
-		return int((l.next.Add(1) - 1) % uint64(len(l.members)))
+		return l.nextIndex()
 	}
-	var source string
 	if ctx != nil {
 		if metadata := adapter.ContextFrom(ctx); metadata != nil {
-			source = metadata.Source.String()
 			if metadata.Destination.IsValid() {
 				destination = metadata.Destination
 			}
 		}
 	}
-	key := destination.String()
-	if l.strategy == LoadBalanceStrategyStickySessions {
-		key = source + "|" + key
+	host := strings.TrimSuffix(destination.Fqdn, ".")
+	if host == "" {
+		host = destination.AddrString()
 	}
-	hash := fnv.New64a()
-	_, _ = hash.Write([]byte(key))
-	if l.strategy == LoadBalanceStrategyConsistentHashing {
-		return int(hash.Sum64() % uint64(len(l.members)))
+	if addr, err := netip.ParseAddr(host); err == nil {
+		host = addr.WithZone("").Unmap().String()
+	} else if site, err := publicsuffix.EffectiveTLDPlusOne(host); err == nil {
+		host = site
 	}
-	l.sticky.Lock()
-	defer l.sticky.Unlock()
+	l.selectionMu.Lock()
+	defer l.selectionMu.Unlock()
 	now := time.Now()
-	if entry, exists := l.stickySessions[key]; exists && now.Before(entry.expires) {
+	if entry, exists := l.domainCache[host]; exists && now.Before(entry.expires) {
+		entry.expires = now.Add(10 * time.Minute)
+		l.domainCache[host] = entry
 		return entry.index
 	}
-	index := int(hash.Sum64() % uint64(len(l.members)))
-	l.stickySessions[key] = stickyEntry{index, now.Add(10 * time.Minute)}
-	for session, entry := range l.stickySessions {
+	index := l.nextIndex()
+	l.domainCache[host] = domainEntry{index, now.Add(10 * time.Minute)}
+	for domain, entry := range l.domainCache {
 		if now.After(entry.expires) {
-			delete(l.stickySessions, session)
+			delete(l.domainCache, domain)
 		}
 	}
+	return index
+}
+
+func (l *LoadBalance) nextIndex() int {
+	index := int((l.next.Add(1) - 1) % uint64(len(l.members)))
+	l.lastSelected.Store(int64(index))
 	return index
 }
 
