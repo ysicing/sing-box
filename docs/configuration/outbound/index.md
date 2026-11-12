@@ -38,6 +38,7 @@
 | `dns`          | [DNS](./dns/)                   |
 | `selector`     | [Selector](./selector/)         |
 | `urltest`      | [URLTest](./urltest/)           |
+| `load-balance` | [Load Balance](./load-balance/) |
 | `naive`        | [NaiveProxy](./naive/)          |
 
 #### tag

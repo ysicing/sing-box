@@ -8,6 +8,11 @@ type SelectorOutboundOptions struct {
 	InterruptExistConnections bool     `json:"interrupt_exist_connections,omitempty"`
 }
 
+type LoadBalanceOutboundOptions struct {
+	Outbounds []string `json:"outbounds" reference:"outbound"`
+	Strategy  string   `json:"strategy,omitempty"`
+}
+
 type URLTestOutboundOptions struct {
 	Outbounds                 []string           `json:"outbounds" reference:"outbound"`
 	URL                       string             `json:"url,omitempty"`
